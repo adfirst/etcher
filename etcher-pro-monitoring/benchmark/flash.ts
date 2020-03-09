@@ -1,95 +1,108 @@
 #!/usr/src/app/node_modules/.bin/ts-node
 
-import { createReadStream, createWriteStream, promises as fs } from 'fs';
+import { constants, createWriteStream } from 'fs';
 import { resolve as resolvePath } from 'path';
-import { Readable } from 'stream';
 import { Argv } from 'yargs';
 
-function createReader(size: number, sourceHighWaterMark: number) {
-	return createReadStream('/dev/zero', {
-		end: size,
-		highWaterMark: sourceHighWaterMark,
-	});
+import { ReadStream } from './directio';
+
+function createReader(
+	path: string,
+	size: number | undefined,
+	direct: boolean,
+	numBuffers: number,
+): ReadStream {
+	return new ReadStream(path, direct, size, numBuffers);
 }
 
 async function flash(
-	size: number,
-	sourceHighWaterMark: number,
-	destinationHighWaterMark: number,
-	oneSource: boolean,
-	devices: string[] = [],
+	numBuffers: number,
+	size: number | undefined,
+	inputDirect: boolean,
+	outputDirect: boolean,
+	input: string,
+	outputs: string[] = [],
 ) {
 	const promises: Array<Promise<void>> = [];
-	const outputs = devices.map((f: string) => resolvePath(f));
-	let globalSource: Readable;
-	if (oneSource) {
-		globalSource = createReader(size, sourceHighWaterMark);
-		promises.push(
-			new Promise((resolve, reject) => {
-				globalSource.on('close', resolve);
-				globalSource.on('error', reject);
-			}),
-		);
-		globalSource.setMaxListeners(outputs.length + 1);
-	}
+	const source = createReader(input, size, inputDirect, numBuffers);
+	source.setMaxListeners(outputs.length + 1);
+	promises.push(
+		new Promise((resolve, reject) => {
+			source.on('close', resolve);
+			source.on('error', reject);
+		}),
+	);
 	const start = new Date().getTime();
 	for (const output of outputs) {
+		let flags = constants.O_WRONLY;
+		if (outputDirect) {
+			flags |= constants.O_DIRECT | constants.O_EXCL | constants.O_SYNC;
+		}
 		const destination = createWriteStream(output, {
-			highWaterMark: destinationHighWaterMark,
+			objectMode: true,
+			highWaterMark: numBuffers - 1,
+			// @ts-ignore (flags can be a number)
+			flags,
 		});
+		const origWrite = destination._write.bind(destination);
+		destination._write = (...args) => {
+			// @ts-ignore
+			console.log('write start', args[0].index);
+			const origOnWrite = args[2]
+			args[2] = (...aargs) => {
+				// @ts-ignore
+				origOnWrite(...aargs)
+				console.log('write end', args[0].index);
+			}
+			// @ts-ignore
+			return origWrite(...args);
+		}
 		promises.push(
 			new Promise((resolve, reject) => {
 				destination.on('close', resolve);
 				destination.on('error', reject);
 			}),
 		);
-		let source: Readable;
-		if (globalSource !== undefined) {
-			source = globalSource;
-		} else {
-			source = createReader(size, sourceHighWaterMark);
-			promises.push(
-				new Promise((resolve, reject) => {
-					source.on('close', resolve);
-					source.on('error', reject);
-				}),
-			);
-		}
 		source.pipe(destination);
 	}
 	await Promise.all(promises);
 	const end = new Date().getTime();
 	const duration = (end - start) / 1000;
+	if (size === undefined) {
+		size = source.bytesRead;
+	}
 	console.log('total time', duration, 's');
 	console.log('speed', size / 1024 ** 2 / duration, 'MiB/s');
 }
 
 const argv = require('yargs').command(
-	'$0 [devices..]',
+	'$0 input [devices..]',
 	'Write zeros to devices',
 	(yargs: Argv) => {
+		yargs.positional('input', { describe: 'Input device' });
 		yargs.positional('devices', { describe: 'Devices to write to' });
+		yargs.option('numBuffers', {
+			default: 2,
+			describe: 'Number of 1MiB buffers used by the reader',
+		});
 		yargs.option('size', {
-			default: 1500 * 1024 ** 2,
+			type: 'number',
 			describe: 'Size in bytes',
-		});
-		yargs.option('sourceHighWaterMark', {
-			default: 1024 ** 2,
-			describe: 'Source high water mark in bytes',
-		});
-		yargs.option('destinationHighWaterMark', {
-			default: 64 * 1024 ** 2,
-			describe: 'Destinations high water mark in bytes',
 		});
 		yargs.option('loop', {
 			type: 'boolean',
 			default: false,
 			describe: 'Indefinitely restart flashing when done',
 		});
-		yargs.option('oneSource', {
+		yargs.option('inputDirect', {
 			type: 'boolean',
 			default: false,
-			describe: 'Use only one reader for /dev/zero',
+			describe: 'Use direct io for input',
+		});
+		yargs.option('outputDirect', {
+			type: 'boolean',
+			default: false,
+			describe: 'Use direct io for output',
 		});
 	},
 ).argv;
@@ -101,11 +114,12 @@ async function main() {
 	}
 	while (true) {
 		await flash(
+			argv.numBuffers,
 			argv.size,
-			argv.sourceHighWaterMark,
-			argv.destinationHighWaterMark,
-			argv.oneSource,
-			argv.devices,
+			argv.inputDirect,
+			argv.outputDirect,
+			resolvePath(argv.input),
+			argv.devices.map((f: string) => resolvePath(f)),
 		);
 		if (!argv.loop) {
 			break;
