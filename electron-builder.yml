@@ -49,6 +49,7 @@ dmg:
     width: 540
     height: 405
 win:
+  asar: false
   icon: assets/icon.ico
 nsis:
   oneClick: true
