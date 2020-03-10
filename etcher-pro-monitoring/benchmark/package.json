@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@ronomon/direct-io": "^3.0.1",
+    "rwmutex": "^1.0.0",
     "yargs": "^15.1.0"
   }
 }
